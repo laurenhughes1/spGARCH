@@ -1,21 +1,33 @@
 # ============================================================
-# Shiny: SpGARCH(1,1) with Toeplitz W --- THIS VERSION WORKS
+# Shiny: SpGARCH(1,1) with Toeplitz W 
 # - No re-simulation when parameters change
 # - Pre-simulated ε (N_max x T_max) and initial σ^2 (N_max) at startup
 # - Model:
 #   σ_t^2 = ω·1 + α p_{t-1} + β σ_{t-1}^2 + γ W ε_{t-1}^2
 # - Plots : heatmap + contour at selected time point
+# - Constraint enforced: α + β + γ·ρ(W) < 1
 # ============================================================
 
 library(shiny)
 library(ggplot2)
 
 # ---------- Helpers ----------
+# Geometric-decay Toeplitz W with diagonal = 0; optional row-normalization
 make_toeplitz <- function(N, rho = 0.5, normalize = FALSE) {
   first_col <- rho^(0:(N - 1))
   W <- toeplitz(first_col)
-  if (normalize) W <- W / rowSums(W)
+  diag(W) <- 0  # enforce zero diagonal
+  if (normalize) {
+    rs <- rowSums(W)
+    rs[rs == 0] <- 1  # avoid division-by-zero (e.g., when rho = 0)
+    W <- W / rs
+  }
   W
+}
+
+# Spectral radius ρ(W) (largest |eigenvalue|)
+spectral_radius <- function(W) {
+  max(abs(eigen(W, only.values = TRUE)$values))
 }
 
 # Reshape vector of length d*d into grid data frame for ggplot
@@ -31,7 +43,7 @@ D_MAX  <- 40       # max d (so max N = D_MAX^2)
 T_MAX  <- 1000     # max time to pre-simulate
 set.seed(5)
 
-# Pre-simulate once (global, reused)
+# Pre-simulate once (global, reused) -- these are ε (not z)
 EPS_POOL <- matrix(rnorm(D_MAX * D_MAX * T_MAX),
                    nrow = D_MAX * D_MAX, ncol = T_MAX)
 SIGMA2_INIT_POOL <- abs(rnorm(D_MAX * D_MAX, mean = 1, sd = 0.25))^2
@@ -55,15 +67,16 @@ ui <- fluidPage(
       hr(),
       sliderInput("rho",   "ρ (Toeplitz decay in W):",
                   min = 0, max = 0.99, value = 0.5, step = 0.01),
-      checkboxInput("normalizeW", "Row-normalize W", value = FALSE)
+      checkboxInput("normalizeW", "Row-normalize W", value = FALSE),
+      hr(),
+      verbatimTextOutput("stabilityInfo")
     ),
     mainPanel(
       fluidRow(
         column(6, plotOutput("heatmapPlot", height = "450px")),
         column(6, plotOutput("contourPlot", height = "450px"))
       ),
-      br(),
-      # verbatimTextOutput("stabilityInfo")
+      br()
     )
   )
 )
@@ -90,13 +103,27 @@ server <- function(input, output, session) {
     SIGMA2_INIT_POOL[seq_len(N())]
   })
   
-  # Build W
+  # Build W (geometric Toeplitz, diag=0)
   W <- reactive({
     make_toeplitz(N = N(), rho = input$rho, normalize = input$normalizeW)
   })
   
+  # Stability constraint checker
+  stability <- reactive({
+    Wm <- W()
+    rhoW <- spectral_radius(Wm)
+    lhs  <- input$alpha + input$beta + input$gamma * rhoW
+    list(rhoW = rhoW, lhs = lhs, ok = (lhs < 1 - 1e-10))
+  })
+  
   # Run temporal recursion deterministically with fixed eps and initial sigma2
   sigma2_cube <- reactive({
+    # Enforce α + β + γ·ρ(W) < 1 (block rendering if violated)
+    stab <- stability()
+    validate(need(stab$ok,
+                  sprintf("Stability constraint violated: α + β + γ·ρ(W) = %.4f (must be < 1). ρ(W)=%.4f",
+                          stab$lhs, stab$rhoW)))
+    
     Nn <- N(); Tt <- input$T
     Wm <- W()
     omega <- input$omega
@@ -150,11 +177,14 @@ server <- function(input, output, session) {
       theme_minimal(base_size = 11)
   })
   
-  # Simple diagnostics
+  # Diagnostics
   output$stabilityInfo <- renderPrint({
+    stab <- stability()
     cat("N =", N(), "(d =", input$d, "),  T =", input$T, ",  t* =", input$tstar, "\n")
-    cat("α + β =", round(input$alpha + input$beta, 4),
-        "(usual stationarity heuristic: α + β < 1)\n")
+    cat("α + β =", round(input$alpha + input$beta, 4), "\n")
+    cat(sprintf("ρ(W) = %.6f\n", stab$rhoW))
+    cat(sprintf("α + β + γ·ρ(W) = %.6f  -> %s\n",
+                stab$lhs, if (stab$ok) "OK (< 1)" else "VIOLATES (< 1 required)"))
     if (input$normalizeW) {
       cat("W is row-normalized (rows sum to 1).\n")
     } else {
